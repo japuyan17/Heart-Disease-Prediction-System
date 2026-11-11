@@ -17,7 +17,7 @@ Trained on 241 patients, tested on a held-out 61 (stratified split, `random_stat
 | Model | Recall | Precision | F1 | ROC-AUC | Accuracy |
 |---|---|---|---|---|---|
 | Logistic Regression (baseline) | 0.809 | 0.860 | 0.832 | 0.926 | 0.851 |
-| Random Forest | 0.782 | 0.846 | 0.807 | 0.907 | 0.830 |
+| Random Forest | 0.782 | 0.846 | 0.807 | 0.908 | 0.830 |
 | XGBoost | 0.764 | 0.775 | 0.765 | 0.887 | 0.784 |
 
 **Held-out test set at the recall-tuned threshold** (chosen to catch about 90% of sick patients in training data). Brackets are 95% bootstrap confidence intervals from 2,000 resamples of the test set.
