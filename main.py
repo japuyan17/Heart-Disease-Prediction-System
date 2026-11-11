@@ -11,8 +11,11 @@ import sqlite3
 import warnings
 from pathlib import Path
 
+import joblib
 import numpy as np
 import pandas as pd
+import matplotlib
+matplotlib.use("Agg")  # save figures to disk; never open windows
 import matplotlib.pyplot as plt
 import seaborn as sns
 import shap
@@ -28,7 +31,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
 from xgboost import XGBClassifier
 from sklearn.metrics import (
-    accuracy_score, precision_score, recall_score, f1_score, roc_auc_score,
+    accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, roc_curve,
     confusion_matrix, precision_recall_curve, ConfusionMatrixDisplay, RocCurveDisplay,
 )
 
@@ -42,9 +45,14 @@ sns.set_theme(style="whitegrid")
 DATA_PATH = "heart_disease_data.csv"
 DB_PATH = "heart.db"
 FIG_DIR = Path("figures")
+TAB_DIR = Path("tableau")
+MODEL_DIR = Path("models")
+RESULTS_DIR = Path("results")
+
 RANDOM_STATE = 42
 TEST_SIZE = 0.2
 N_JOBS = 4             # parallel workers for the grid searches (lower if it gets killed)
+N_BOOT = 2000          # bootstrap resamples of the test set
 
 # Raw target value that means "has heart disease" (confirmed by the heatmap)
 DISEASE_LABEL = 0
@@ -52,12 +60,16 @@ DISEASE_LABEL = 0
 # Minimum share of sick patients we want to catch when tuning the decision threshold
 TARGET_RECALL = 0.90
 
+# Model served by the Streamlit app
+APP_MODEL = "Logistic Regression"
+
 # Feature groups
 NUMERIC = ["age", "trestbps", "chol", "thalach", "oldpeak"]  # scaled
 CATEGORICAL = ["cp", "restecg", "slope", "thal"]             # one-hot encoded
 PASSTHROUGH = ["sex", "fbs", "exang", "ca"]                  # binary / ordinal
 
-FIG_DIR.mkdir(exist_ok=True)
+for folder in (FIG_DIR, TAB_DIR, MODEL_DIR, RESULTS_DIR):
+    folder.mkdir(exist_ok=True)
 
 
 def save_fig(name: str) -> None:
@@ -233,8 +245,10 @@ for name, pipe in pipes.items():
     scores = cross_validate(pipe, X_train, y_train, cv=cv, scoring=scoring, n_jobs=N_JOBS)
     cv_rows[name] = {m: scores[f"test_{m}"].mean() for m in scoring}
 
+cv_table = pd.DataFrame(cv_rows).T.round(3)
 print("\n=== 5-fold CV baseline (defaults, training data) ===")
-print(pd.DataFrame(cv_rows).T.round(3))
+print(cv_table)
+cv_table.to_csv(RESULTS_DIR / "cv_baseline.csv")
 
 
 # =============================================================================
@@ -306,10 +320,72 @@ results = (pd.DataFrame(rows)
 
 print("\n=== Test set comparison (sorted by recall, then precision) ===")
 print(results.to_string())
+results.to_csv(RESULTS_DIR / "test_results.csv")
 
 
 # =============================================================================
-# 13. EVALUATION PLOTS
+# 13. BOOTSTRAP CONFIDENCE INTERVALS
+# =============================================================================
+# The test set is small (61 patients), so a single score is noisy. Resample the
+# test set with replacement N_BOOT times to see how much each metric can move.
+rng = np.random.default_rng(RANDOM_STATE)
+y_arr = y_test.to_numpy()
+boot_idx = rng.integers(0, len(y_arr), size=(N_BOOT, len(y_arr)))
+
+
+def bootstrap_metrics(pred: np.ndarray, prob: np.ndarray) -> dict:
+    """Mean and 95% percentile CI of recall, precision, F1, and ROC-AUC."""
+    samples = {"Recall": [], "Precision": [], "F1": [], "ROC-AUC": []}
+    for idx in boot_idx:
+        yt, yp, pr = y_arr[idx], pred[idx], prob[idx]
+        if yt.sum() == 0 or yt.sum() == len(yt):
+            continue  # skip resamples missing a class
+        tp = int(((yt == 1) & (yp == 1)).sum())
+        fp = int(((yt == 0) & (yp == 1)).sum())
+        fn = int(((yt == 1) & (yp == 0)).sum())
+        recall = tp / (tp + fn)
+        precision = tp / (tp + fp) if (tp + fp) else 0.0
+        samples["Recall"].append(recall)
+        samples["Precision"].append(precision)
+        samples["F1"].append(2 * precision * recall / (precision + recall) if (precision + recall) else 0.0)
+        samples["ROC-AUC"].append(roc_auc_score(yt, pr))
+    out = {}
+    for metric, vals in samples.items():
+        low, high = np.percentile(vals, [2.5, 97.5])
+        out[metric] = f"{np.mean(vals):.3f} [{low:.3f}, {high:.3f}]"
+        out[f"{metric}_mean"], out[f"{metric}_low"], out[f"{metric}_high"] = np.mean(vals), low, high
+    return out
+
+
+boot_rows = []
+for (name, label), pred in preds.items():
+    boot_rows.append({"Model": name, "Threshold type": label,
+                      **bootstrap_metrics(pred, test_probs[name])})
+
+boot_full = pd.DataFrame(boot_rows)
+boot_display = (boot_full[["Model", "Threshold type", "Recall", "Precision", "F1", "ROC-AUC"]]
+                .set_index(["Model", "Threshold type"]))
+
+print(f"\n=== Bootstrap 95% CIs on the test set ({N_BOOT} resamples): mean [low, high] ===")
+print(boot_display.to_string())
+boot_full.to_csv(RESULTS_DIR / "bootstrap_ci.csv", index=False)
+
+# Plot recall and precision with error bars for the recall-tuned threshold
+tuned_boot = boot_full[boot_full["Threshold type"] == "recall-tuned"].reset_index(drop=True)
+fig, axes = plt.subplots(1, 2, figsize=(11, 4), sharey=True)
+for ax, metric in zip(axes, ["Recall", "Precision"]):
+    mean, low, high = (tuned_boot[f"{metric}_{s}"] for s in ("mean", "low", "high"))
+    ax.errorbar(tuned_boot["Model"], mean, yerr=[mean - low, high - mean],
+                fmt="o", capsize=6, markersize=8)
+    ax.set_title(f"{metric} (recall-tuned threshold, 95% bootstrap CI)")
+    ax.set_ylim(0.3, 1.05)
+    ax.tick_params(axis="x", rotation=15)
+plt.tight_layout()
+save_fig("bootstrap_ci")
+
+
+# =============================================================================
+# 14. EVALUATION PLOTS
 # =============================================================================
 # Confusion matrices: top row = default 0.50 threshold, bottom = recall-tuned
 fig, axes = plt.subplots(2, 3, figsize=(14, 8))
@@ -341,7 +417,7 @@ save_fig("recall_vs_precision")
 
 
 # =============================================================================
-# 14. FEATURE IMPORTANCE
+# 15. FEATURE IMPORTANCE
 # =============================================================================
 feature_names = best_models["Random Forest"].named_steps["prep"].get_feature_names_out()
 
@@ -358,7 +434,7 @@ save_fig("feature_importance")
 
 
 # =============================================================================
-# 15. SHAP EXPLAINABILITY (XGBoost)
+# 16. SHAP EXPLAINABILITY (XGBoost)
 # =============================================================================
 xgb_best = best_models["XGBoost"]
 X_test_processed = xgb_best.named_steps["prep"].transform(X_test)
@@ -366,16 +442,26 @@ shap_values = shap.TreeExplainer(xgb_best.named_steps["model"])(X_test_processed
 shap.summary_plot(shap_values, X_test_processed, show=False)
 save_fig("shap_summary")
 
-print(f"\nDone. Figures saved to {FIG_DIR.resolve()}")
 
 # =============================================================================
-# 16. EXPORT FOR TABLEAU
+# 17. SAVE MODEL FOR THE STREAMLIT APP
 # =============================================================================
-from sklearn.metrics import roc_curve
+app_row = results.xs((APP_MODEL, "recall-tuned"))
+joblib.dump({
+    "model": best_models[APP_MODEL],
+    "name": APP_MODEL,
+    "threshold": thresholds[APP_MODEL],
+    "features": list(X.columns),
+    "test_recall": float(app_row["Recall"]),
+    "test_precision": float(app_row["Precision"]),
+    "test_roc_auc": float(app_row["ROC-AUC"]),
+}, MODEL_DIR / "heart_model.joblib")
+print(f"\nSaved {APP_MODEL} (threshold {thresholds[APP_MODEL]:.3f}) to {MODEL_DIR / 'heart_model.joblib'}")
 
-TAB_DIR = Path("tableau")
-TAB_DIR.mkdir(exist_ok=True)
 
+# =============================================================================
+# 18. EXPORT FOR TABLEAU
+# =============================================================================
 # 1. Patient-level data with readable labels
 patients = df.drop(columns="target").copy()
 patients["disease"] = np.where(y == 1, "Disease", "Healthy")
@@ -438,4 +524,8 @@ for name, prob in test_probs.items():
     test_out[f"{name} risk"] = prob
 test_out.to_csv(TAB_DIR / "test_predictions.csv", index=False)
 
+# 8. Bootstrap intervals
+boot_full.to_csv(TAB_DIR / "bootstrap_ci.csv", index=False)
+
 print(f"Tableau files saved to {TAB_DIR.resolve()}")
+print(f"\nDone. Figures saved to {FIG_DIR.resolve()}")
